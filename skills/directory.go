@@ -64,19 +64,30 @@ type DirectoryProvider struct {
 	cacheMu           sync.Mutex
 	cached            *directoryCatalog
 	refreshedAt       time.Time
+	stale             bool
 }
 
+type catalogMode int
+
+const (
+	catalogPaths catalogMode = iota
+	catalogMetadata
+	catalogManifests
+)
+
 type directoryCatalog struct {
-	skills  []*Skill
-	bySkill map[string]*Skill
-	files   map[string]catalogFile
-	dirs    map[string][]*mcp.Resource
-	seen    map[[2]string]bool
+	skills    []*Skill
+	bySkill   map[string]*Skill
+	files     map[string]catalogFile
+	dirs      map[string][]*mcp.Resource
+	seen      map[[2]string]bool
+	resources []*mcp.Resource
 }
 
 type catalogFile struct {
 	path     string
 	mimeType string
+	resource *mcp.Resource
 }
 
 type catalogEntry struct {
@@ -161,7 +172,7 @@ func newDirectoryProvider(fsys fs.FS, options *DirectoryOptions) (*DirectoryProv
 
 func (p *DirectoryProvider) initialize() (*DirectoryProvider, error) {
 	if p.preload {
-		if _, err := p.catalog(context.Background(), true); err != nil {
+		if _, err := p.catalog(context.Background(), catalogManifests); err != nil {
 			return nil, err
 		}
 	}
@@ -186,7 +197,8 @@ func AddFS(server *mcp.Server, fsys fs.FS, options *DirectoryOptions) error {
 	return provider.AddTo(server)
 }
 
-// AddTo registers the provider's extension handlers and resource template.
+// AddTo registers the provider's extension handlers, resource template, and live
+// resource listing. Register one filesystem provider per server.
 func (p *DirectoryProvider) AddTo(server *mcp.Server) error {
 	if err := AddHandlers(server, &Handlers{
 		List:          p.ListSkills,
@@ -200,6 +212,7 @@ func (p *DirectoryProvider) AddTo(server *mcp.Server) error {
 		Description: "Resources served by the MCP Skills extension.",
 		URITemplate: "skill://{authority}/{+path}",
 	}, p.ReadResource)
+	server.AddReceivingMiddleware(p.listResourcesMiddleware)
 	return nil
 }
 
@@ -215,7 +228,7 @@ func (p *DirectoryProvider) Refresh(ctx context.Context) error {
 
 // ListSkills returns a current, paginated view of the skills in the filesystem.
 func (p *DirectoryProvider) ListSkills(ctx context.Context, _ *mcp.ServerSession, params *ListSkillsParams) (*ListSkillsResult, error) {
-	catalog, err := p.catalog(ctx, true)
+	catalog, err := p.catalog(ctx, catalogManifests)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +248,7 @@ func (p *DirectoryProvider) GetSkill(ctx context.Context, _ *mcp.ServerSession, 
 	if params == nil {
 		return nil, invalidParams("missing required uri")
 	}
-	catalog, err := p.catalog(ctx, true)
+	catalog, err := p.catalog(ctx, catalogManifests)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +264,7 @@ func (p *DirectoryProvider) ReadResource(ctx context.Context, req *mcp.ReadResou
 	if req == nil || req.Params == nil {
 		return nil, invalidParams("missing required uri")
 	}
-	catalog, err := p.catalog(ctx, false)
+	catalog, err := p.catalog(ctx, catalogPaths)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +293,7 @@ func (p *DirectoryProvider) ReadDirectory(ctx context.Context, _ *mcp.ServerSess
 	if params == nil {
 		return nil, invalidParams("missing required uri")
 	}
-	catalog, err := p.catalog(ctx, false)
+	catalog, err := p.catalog(ctx, catalogMetadata)
 	if err != nil {
 		return nil, err
 	}
@@ -295,14 +308,15 @@ func (p *DirectoryProvider) ReadDirectory(ctx context.Context, _ *mcp.ServerSess
 	return &ReadDirectoryResult{Resources: page, NextCursor: next}, nil
 }
 
-func (p *DirectoryProvider) catalog(ctx context.Context, manifests bool) (*directoryCatalog, error) {
+func (p *DirectoryProvider) catalog(ctx context.Context, mode catalogMode) (*directoryCatalog, error) {
 	if !p.cacheEnabled {
-		return p.scanCatalog(ctx, manifests)
+		return p.scanCatalog(ctx, mode)
 	}
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
 	invalidated := p.invalidated()
-	if p.cached != nil && !invalidated && (p.maxAge == 0 || time.Since(p.refreshedAt) < p.maxAge) {
+	p.stale = p.stale || invalidated
+	if p.cached != nil && !p.stale && (p.maxAge == 0 || time.Since(p.refreshedAt) < p.maxAge) {
 		return p.cached, nil
 	}
 	if err := p.refreshLocked(ctx); err != nil {
@@ -312,12 +326,14 @@ func (p *DirectoryProvider) catalog(ctx context.Context, manifests bool) (*direc
 }
 
 func (p *DirectoryProvider) refreshLocked(ctx context.Context) error {
-	catalog, err := p.scanCatalog(ctx, true)
+	p.stale = true
+	catalog, err := p.scanCatalog(ctx, catalogManifests)
 	if err != nil {
 		return err
 	}
 	p.cached = catalog
 	p.refreshedAt = time.Now()
+	p.stale = false
 	return nil
 }
 
@@ -338,7 +354,8 @@ func (p *DirectoryProvider) invalidated() bool {
 	return requested
 }
 
-func (p *DirectoryProvider) scanCatalog(ctx context.Context, manifests bool) (*directoryCatalog, error) {
+func (p *DirectoryProvider) scanCatalog(ctx context.Context, mode catalogMode) (*directoryCatalog, error) {
+	manifests := mode == catalogManifests
 	fsys, closeFS, err := p.openFS()
 	if err != nil {
 		return nil, err
@@ -381,12 +398,13 @@ func (p *DirectoryProvider) scanCatalog(ctx context.Context, manifests bool) (*d
 		seen:    make(map[[2]string]bool),
 	}
 	digests := make(map[string]catalogDigest)
+	frontmatters := make(map[string]Frontmatter)
 	for _, skillDir := range skillDirs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		var frontmatter Frontmatter
-		if manifests || skillDir == "." && p.rootName == "" {
+		if mode >= catalogMetadata || skillDir == "." && p.rootName == "" {
 			data, err := fs.ReadFile(fsys, path.Join(skillDir, "SKILL.md"))
 			if err != nil {
 				return nil, err
@@ -395,6 +413,7 @@ func (p *DirectoryProvider) scanCatalog(ctx context.Context, manifests bool) (*d
 			if err != nil {
 				return nil, fmt.Errorf("skills: parsing %s/SKILL.md: %w", skillDir, err)
 			}
+			frontmatters[path.Join(skillDir, "SKILL.md")] = frontmatter
 		}
 		segments := slices.Clone(p.prefix)
 		if skillDir == "." {
@@ -434,7 +453,13 @@ func (p *DirectoryProvider) scanCatalog(ctx context.Context, manifests bool) (*d
 			}
 			resourceURI := rootURI + "/" + escapePath(rel)
 			mimeType := resourceMIME(item.path, rel)
-			catalog.files[resourceURI] = catalogFile{path: item.path, mimeType: mimeType}
+			file := catalogFile{path: item.path, mimeType: mimeType}
+			if mode >= catalogMetadata {
+				file.resource = &mcp.Resource{
+					URI: resourceURI, Name: path.Base(item.path), MIMEType: mimeType, Size: item.info.Size(),
+				}
+			}
+			catalog.files[resourceURI] = file
 			if !manifests {
 				continue
 			}
@@ -469,8 +494,24 @@ func (p *DirectoryProvider) scanCatalog(ctx context.Context, manifests bool) (*d
 			catalog.bySkill[skill.URI] = skill
 		}
 	}
+	for _, file := range catalog.files {
+		if file.resource == nil {
+			continue
+		}
+		if frontmatter, ok := frontmatters[file.path]; ok {
+			file.resource.Name, _ = frontmatter["name"].(string)
+			file.resource.Description, _ = frontmatter["description"].(string)
+		}
+		catalog.resources = append(catalog.resources, file.resource)
+	}
+	slices.SortFunc(catalog.resources, func(a, b *mcp.Resource) int { return strings.Compare(a.URI, b.URI) })
 	slices.SortFunc(catalog.skills, func(a, b *Skill) int { return strings.Compare(a.URI, b.URI) })
 	for uri := range catalog.dirs {
+		for i, resource := range catalog.dirs[uri] {
+			if file, ok := catalog.files[resource.URI]; ok && file.resource != nil {
+				catalog.dirs[uri][i] = file.resource
+			}
+		}
 		slices.SortFunc(catalog.dirs[uri], func(a, b *mcp.Resource) int { return strings.Compare(a.URI, b.URI) })
 	}
 	if manifests {

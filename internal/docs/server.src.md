@@ -526,8 +526,9 @@ that cannot publish stable file digests.
 For skills stored on disk, `skills.AddDirectory` installs a filesystem-backed
 provider. By default it discovers skills and files on every request, so
 resources added after server startup are available without re-registering
-them. It also serves skill files through `resources/read` and supports
-paginated directory reads.
+them. This applies to `skills/list`, `skills/get`, `resources/list`,
+`resources/read`, and `resources/directory/read`. Changes and removals are
+visible on the next request too.
 
 ```go
 if err := skills.AddDirectory(server, "./skills", &skills.DirectoryOptions{
@@ -536,6 +537,31 @@ if err := skills.AddDirectory(server, "./skills", &skills.DirectoryOptions{
     return err
 }
 ```
+
+`resources/list` includes the skill files alongside ordinary registered
+resources. `SKILL.md` entries carry their frontmatter name and description and
+the `text/markdown` MIME type. Directory reads return only direct children,
+including subdirectories with MIME type `inode/directory`, and use the same
+file metadata. Neither listing reads supporting file contents just to enumerate
+them; `skills/list` and `skills/get` also hash files to build static manifests.
+
+The helper combines all pages of the underlying resource listing with its
+current catalog, deduplicates by URI, and paginates the result using
+`DirectoryOptions.PageSize`. Exact resource registrations take precedence over
+the template, for both listing and reading. This uses existing receiving
+middleware and resource-template routing; it does not change the core SDK APIs.
+The merge costs a traversal of the underlying resource list on each request.
+
+Live discovery does not require `skills.DynamicResources()`: that marker means
+the server cannot provide a complete manifest with stable digests, not that its
+catalog changes over time. A filesystem provider returns a complete static
+manifest for the current catalog; a later request can return a different one.
+
+Clients must re-list to see changes. The helper starts no watcher and sends no
+filesystem-change notifications; SEP-2640 defines no `skills/list_changed`
+notification. The merged `resources/list` response has a zero TTL and private
+cache scope so a TTL configured for ordinary resources cannot conceal changes.
+These cache fields are omitted on older protocol versions by the core SDK.
 
 Set `Cache` to `&skills.DirectoryCacheOptions{}` to load the catalog on the
 first request and cache it indefinitely. Set `Preload: true` to load it while
@@ -547,6 +573,10 @@ Cached providers can also be invalidated by a clock or filesystem monitor throug
 `DirectoryCacheOptions.Invalidate`. Signals are coalesced and consumed when a
 request arrives; use a buffered channel so producers do not block. Both
 `MaxAge` and `Invalidate` are lazy: they do not start a background goroutine.
+A failed rebuild retains the previous catalog but leaves it stale: requests
+retry rebuilding until successful, even if the invalidation signal has already
+been consumed. They return the scan error instead of silently serving stale
+metadata. Resource bytes are always read on demand, including in cached modes.
 
 To rebuild before the next request, construct a provider directly and call
 `Refresh` from the application's watcher goroutine. The caller owns goroutine
