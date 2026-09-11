@@ -26,8 +26,20 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	internaljson "github.com/modelcontextprotocol/go-sdk/internal/json"
 	"github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2"
+	"github.com/modelcontextprotocol/go-sdk/internal/mcpgodebug"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
+
+// nowrapinvalidparams is a compatibility parameter that restores the previous
+// behavior of [methodInfo.unmarshalParams]. When unset (the default), a
+// params-decoding failure is wrapped with [jsonrpc2.ErrInvalidParams] so the
+// wire response carries error code -32602 ("invalid params") rather than the
+// zero-value code 0. See:
+// https://github.com/modelcontextprotocol/go-sdk/issues/976#issuecomment-4829124838.
+//
+// See the documentation for the mcpgodebug package for instructions how to enable it.
+// The option will be removed in a future version of the SDK.
+var nowrapinvalidparams = mcpgodebug.Value("nowrapinvalidparams")
 
 const (
 	// latestProtocolVersion is the latest protocol version that this version of
@@ -51,21 +63,39 @@ var supportedProtocolVersions = []string{
 	protocolVersion20241105,
 }
 
+// SupportedProtocolVersions returns the protocol versions supported by this
+// version of the SDK, newest first.
+//
+// Use it to discover the values accepted by
+// [ServerOptions.SupportedProtocolVersions]. The returned slice is a copy:
+// modifying it does not change what the SDK supports.
+func SupportedProtocolVersions() []string { return slices.Clone(supportedProtocolVersions) }
+
 // negotiatedVersion returns the effective protocol version to use, given a
-// client version.
-func negotiatedVersion(clientVersion string) string {
-	// In general, prefer to use the clientVersion, but if we don't support the
-	// client's version, use the latest version.
+// client version and the versions the server supports, newest first.
+func negotiatedVersion(clientVersion string, supported []string) string {
+	// In general, prefer to use the clientVersion, but if not supported
+	// by the server, use the latest version the server supports.
 	//
-	// This handles the case where a new spec version is released, and the SDK
-	// does not support it yet.
 	// Cap the supported versions at the legacy protocolVersion20251125, as this
 	// method is used by the initialize method which is deprecated in
 	// version protocolVersion20260728.
-	if !slices.Contains(supportedProtocolVersions, clientVersion) {
-		return protocolVersion20251125
+	if slices.Contains(supported, clientVersion) && clientVersion < protocolVersion20260728 {
+		return clientVersion
 	}
-	return clientVersion
+	for _, v := range supported {
+		if v < protocolVersion20260728 {
+			return v
+		}
+	}
+	// If the server was enforced to support only protocolVersion20260728 and
+	// later, the initialize function should not be called.
+	// If a client calls the initialize function, return the protocolVersion20251125.
+	// As according to spec (https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation):
+	// "If the server supports the requested protocol version, it MUST respond with the same version."
+	// "Otherwise, the server MUST respond with another protocol version it supports."
+	// "This SHOULD be the latest version supported by the server."
+	return protocolVersion20251125
 }
 
 // negotiateMutuallySupportedVersion returns a protocol version that is supported
@@ -306,7 +336,17 @@ func newMethodInfo[P paramsPtr[T], R Result, T any](flags methodFlags) methodInf
 			var p P
 			if m != nil {
 				if err := internaljson.Unmarshal(m, &p); err != nil {
-					return nil, fmt.Errorf("unmarshaling %q into a %T: %w", m, p, err)
+					// Legacy behavior: pre-fix versions surfaced this as a
+					// plain wrapped error, which caused the wire response to
+					// carry code 0 instead of -32602. Restore via
+					// MCPGODEBUG=nowrapinvalidparams=1.
+					if nowrapinvalidparams == "1" {
+						return nil, fmt.Errorf("unmarshaling %q into a %T: %w", m, p, err)
+					}
+					// Wrap jsonrpc2.ErrInvalidParams so toWireError surfaces
+					// code -32602 ("invalid params") while preserving the
+					// descriptive message.
+					return nil, fmt.Errorf("%w: unmarshaling %q into a %T: %w", jsonrpc2.ErrInvalidParams, m, p, err)
 				}
 			}
 			// We must check missingParamsOK here, in addition to checkRequest, to
@@ -515,12 +555,20 @@ type validatedMeta struct {
 // the >= 2026-07-28 protocol via the `_meta` field.
 // If the request has no _meta, or no protocolVersion in _meta, it returns a non-nil
 // validatedMeta with usesNewProtocol set to false, and a nil error.
-// If the request has a protocolVersion in _meta:
-//   - For notifications, it returns usesNewProtocol set to true and a nil initializeParams.
-//   - For call requests, it validates the presence of clientInfo and clientCapabilities in _meta.
-//     If either is missing or invalid, it returns nil and a non-nil error. Otherwise, it returns
-//     usesNewProtocol set to true and the populated initializeParams.
+// If the request has a protocolVersion in _meta it validates the presence of
+// clientCapabilities in _meta. If it is missing or invalid, it returns nil and
+// a non-nil error. clientInfo is optional; if present but invalid, an error is
+// returned. Otherwise, it returns usesNewProtocol set to true and the populated
+// initializeParams.
+// Notifications always report usesNewProtocol false and never error.
 func validateRequestMeta(req *jsonrpc.Request) (*validatedMeta, error) {
+	// SEP-2575 defines the `_meta` triple for calls only: NotificationParams
+	// declares `_meta` optional with no protocolVersion, so a notification
+	// neither selects the new protocol nor is discarded for carrying an
+	// incomplete triple.
+	if !req.IsCall() {
+		return &validatedMeta{usesNewProtocol: false, initializeParams: nil}, nil
+	}
 	meta := extractRequestMeta(req.Params)
 	if meta == nil {
 		return &validatedMeta{usesNewProtocol: false, initializeParams: nil}, nil
@@ -529,15 +577,15 @@ func validateRequestMeta(req *jsonrpc.Request) (*validatedMeta, error) {
 	if !ok || protocolVersion < protocolVersion20260728 {
 		return &validatedMeta{usesNewProtocol: false, initializeParams: nil}, nil
 	}
-	// Notifications do not carry full client identity.
-	if !req.IsCall() {
-		return &validatedMeta{usesNewProtocol: true, initializeParams: nil}, nil
-	}
-	clientInfo, ok := decodeMetaValue[*Implementation](meta, MetaKeyClientInfo)
-	if !ok {
-		return nil, &jsonrpc.Error{
-			Code:    jsonrpc.CodeInvalidParams,
-			Message: fmt.Sprintf("missing or invalid _meta field %q", MetaKeyClientInfo),
+	var clientInfo *Implementation
+	if _, present := meta[MetaKeyClientInfo]; present {
+		var ok bool
+		clientInfo, ok = decodeMetaValue[*Implementation](meta, MetaKeyClientInfo)
+		if !ok {
+			return nil, &jsonrpc.Error{
+				Code:    jsonrpc.CodeInvalidParams,
+				Message: fmt.Sprintf("invalid _meta field %q", MetaKeyClientInfo),
+			}
 		}
 	}
 	capabilities, ok := decodeMetaValue[*clientCapabilitiesV2](meta, MetaKeyClientCapabilities)

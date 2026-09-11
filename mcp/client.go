@@ -39,11 +39,6 @@ type Client struct {
 	// serverMethodInfos) plus any custom methods registered via
 	// [AddSendingCustomMethod].
 	sendMethods map[string]methodInfo
-	// receiveMethods is the merged map of methods this client may receive from
-	// a server: it always contains the standard client methods (from
-	// clientMethodInfos) plus any custom methods registered via
-	// [AddClientReceivingCustomMethod].
-	receiveMethods map[string]methodInfo
 }
 
 // NewClient creates a new [Client].
@@ -73,9 +68,6 @@ func NewClient(impl *Implementation, options *ClientOptions) *Client {
 	sendMethods := make(map[string]methodInfo, len(serverMethodInfos))
 	maps.Copy(sendMethods, serverMethodInfos)
 
-	receiveMethods := make(map[string]methodInfo, len(clientMethodInfos))
-	maps.Copy(receiveMethods, clientMethodInfos)
-
 	c := &Client{
 		impl:                    impl,
 		opts:                    opts,
@@ -83,13 +75,11 @@ func NewClient(impl *Implementation, options *ClientOptions) *Client {
 		sendingMethodHandler_:   defaultSendingMethodHandler,
 		receivingMethodHandler_: defaultReceivingMethodHandler[*ClientSession],
 		sendMethods:             sendMethods,
-		receiveMethods:          receiveMethods,
 	}
 	if opts.MultiRoundTrip == nil || !opts.MultiRoundTrip.Disabled {
 		c.AddSendingMiddleware(clientMultiRoundTripMiddleware())
 	}
-	applyExtensionsToClient(c)
-	runExtensions(opts.Extensions, func(e Extension) func(*Client) error { return e.Client }, c)
+	applyExtensions(opts.Extensions, func(e Extension) func(*Client) error { return e.Client }, c)
 	return c
 }
 
@@ -215,9 +205,10 @@ type ClientOptions struct {
 	// reset" guidance, letting a transient miss pass without tearing down an
 	// otherwise live session. Has no effect unless KeepAlive is non-zero.
 	KeepAliveFailureThreshold int
-	// Extensions are applied to the client during [NewClient], after any
-	// globally registered extensions (see [RegisterExtension]). Per-client
-	// extensions override global ones for the same method names.
+
+	// Extensions are applied in order during [NewClient], after globally
+	// registered extensions (see [RegisterExtension]). Later registrations
+	// of the same custom method replace earlier ones.
 	Extensions []Extension
 }
 
@@ -260,11 +251,12 @@ func (e unsupportedProtocolVersionError) Error() string {
 	return fmt.Sprintf("unsupported protocol version: %q", e.version)
 }
 
-// ClientSessionOptions is reserved for future use.
+// ClientSessionOptions configures a client session created by [Client.Connect].
 type ClientSessionOptions struct {
-	// protocolVersion overrides the protocol version sent in the initialize
-	// request, for testing. If empty, latestProtocolVersion is used.
-	protocolVersion string
+	// ProtocolVersion is the protocol version sent in the initialize (or
+	// discover) request. If empty, the latest supported version is used.
+	// The server may negotiate a different mutually supported version.
+	ProtocolVersion string
 }
 
 func (c *Client) capabilities(protocolVersion string) *ClientCapabilities {
@@ -326,8 +318,8 @@ func (c *Client) Connect(ctx context.Context, t Transport, opts *ClientSessionOp
 	}
 
 	protocolVersion := latestProtocolVersion
-	if opts != nil && opts.protocolVersion != "" {
-		protocolVersion = opts.protocolVersion
+	if opts != nil && opts.ProtocolVersion != "" {
+		protocolVersion = opts.ProtocolVersion
 	}
 
 	if protocolVersion >= protocolVersion20260728 {
@@ -345,14 +337,20 @@ func (c *Client) Connect(ctx context.Context, t Transport, opts *ClientSessionOp
 				if hc, ok := cs.mcpConn.(clientConnection); ok {
 					hc.sessionUpdated(cs.state)
 				}
-				subscribeParams := &SubscriptionsListenParams{}
-				if c.opts.ToolListChangedHandler != nil {
+				subscribeParams := &SubscriptionsListenParams{
+					Notifications: &NotificationSubscriptions{},
+				}
+				caps := discRes.Capabilities
+				if caps == nil {
+					caps = &ServerCapabilities{}
+				}
+				if c.opts.ToolListChangedHandler != nil && caps.Tools != nil && caps.Tools.ListChanged {
 					subscribeParams.Notifications.ToolsListChanged = true
 				}
-				if c.opts.PromptListChangedHandler != nil {
+				if c.opts.PromptListChangedHandler != nil && caps.Prompts != nil && caps.Prompts.ListChanged {
 					subscribeParams.Notifications.PromptsListChanged = true
 				}
-				if c.opts.ResourceListChangedHandler != nil {
+				if c.opts.ResourceListChangedHandler != nil && caps.Resources != nil && caps.Resources.ListChanged {
 					subscribeParams.Notifications.ResourcesListChanged = true
 				}
 				if subscribeParams.Notifications.ToolsListChanged ||
@@ -401,6 +399,7 @@ func (c *Client) Connect(ctx context.Context, t Transport, opts *ClientSessionOp
 		return nil, err
 	}
 	if !slices.Contains(supportedProtocolVersions, res.ProtocolVersion) {
+		_ = cs.Close()
 		return nil, unsupportedProtocolVersionError{res.ProtocolVersion}
 	}
 	cs.state.InitializeResult = res
@@ -456,11 +455,15 @@ func (c *Client) discover(ctx context.Context, cs *ClientSession) (*InitializeRe
 		}
 	}
 
+	var serverInfo *Implementation
+	if v, ok := decodeMetaValue[*Implementation](res.GetMeta(), MetaKeyServerInfo); ok {
+		serverInfo = v
+	}
 	return &InitializeResult{
 		Capabilities:    res.Capabilities,
 		Instructions:    res.Instructions,
 		ProtocolVersion: negotiated,
-		ServerInfo:      res.ServerInfo,
+		ServerInfo:      serverInfo,
 	}, nil
 }
 
@@ -522,9 +525,12 @@ func (cs *ClientSession) usesNewProtocol() bool {
 	return res != nil && res.ProtocolVersion >= protocolVersion20260728
 }
 
-// injectRequestMeta populates the SEP-2575 per-request `_meta` triple
-// (protocolVersion, clientInfo, clientCapabilities) on the given outgoing
-// request params. Keys already present in params.Meta are not overwritten.
+// injectRequestMeta populates the SEP-2575 per-request `_meta` fields
+// (protocolVersion, optional clientInfo, clientCapabilities) on the given
+// outgoing request params. Keys already present in params.Meta are not
+// overwritten. Per PR modelcontextprotocol/modelcontextprotocol#3002
+// clientInfo is SHOULD (not MUST), and is omitted when the client has no
+// [Implementation] configured.
 func injectRequestMeta[T any, P interface {
 	*T
 	Params
@@ -540,7 +546,7 @@ func injectRequestMeta[T any, P interface {
 	if _, ok := m[MetaKeyProtocolVersion]; !ok {
 		m[MetaKeyProtocolVersion] = res.ProtocolVersion
 	}
-	if _, ok := m[MetaKeyClientInfo]; !ok {
+	if _, ok := m[MetaKeyClientInfo]; !ok && cs.client.impl != nil {
 		m[MetaKeyClientInfo] = cs.client.impl
 	}
 	if _, ok := m[MetaKeyClientCapabilities]; !ok {
@@ -597,19 +603,16 @@ func (cs *ClientSession) Wait() error {
 // outgoing request context for transport-layer features (e.g. x-mcp-header
 // param annotations).
 func (cs *ClientSession) lookupTool(name string) *Tool {
-	var found *Tool
-	cs.toolsCache.forEachValid(func(r *ListToolsResult) {
-		if found != nil {
-			return
-		}
-		for _, t := range r.Tools {
+	cs.toolsCache.mu.Lock()
+	defer cs.toolsCache.mu.Unlock()
+	for _, entry := range cs.toolsCache.cachedValues {
+		for _, t := range entry.result.Tools {
 			if t.Name == name {
-				found = t
-				return
+				return t
 			}
 		}
-	})
-	return found
+	}
+	return nil
 }
 
 // registerElicitationWaiter registers a waiter for an elicitation complete
@@ -1185,9 +1188,7 @@ func (cs *ClientSession) sendingMethodInfos() map[string]methodInfo {
 }
 
 func (cs *ClientSession) receivingMethodInfos() map[string]methodInfo {
-	cs.client.mu.Lock()
-	defer cs.client.mu.Unlock()
-	return cs.client.receiveMethods
+	return clientMethodInfos
 }
 
 func (cs *ClientSession) handle(ctx context.Context, req *jsonrpc.Request) (any, error) {
@@ -1410,7 +1411,7 @@ func (cs *ClientSession) Subscribe(ctx context.Context, params *SubscribeParams)
 	}
 
 	return cs.subscriptionsListen(listenCtx, &SubscriptionsListenParams{
-		Notifications: NotificationSubscriptions{
+		Notifications: &NotificationSubscriptions{
 			ResourceSubscriptions: []string{uri},
 		},
 	})
@@ -1461,7 +1462,7 @@ func (cs *ClientSession) cancelAllResourceSubscriptions() {
 // usual handlers registered in [ClientOptions].
 func (cs *ClientSession) subscriptionsListen(ctx context.Context, params *SubscriptionsListenParams) error {
 	params = injectRequestMeta(cs, params)
-	_, err := handleSend[*emptyResult](ctx, methodSubscriptionsListen, newClientRequest(cs, orZero[Params](params)))
+	_, err := handleSend[*SubscriptionsListenResult](ctx, methodSubscriptionsListen, newClientRequest(cs, orZero[Params](params)))
 	return err
 }
 
@@ -1690,36 +1691,4 @@ func CallCustomMethod[P paramsPtr[PT], R Result, PT any](
 		Session: cs,
 		Params:  params,
 	})
-}
-
-// AddClientReceivingCustomMethod registers a handler for a custom
-// (non-standard) JSON-RPC method that the client may receive from a server.
-//
-// When a server sends a request with the given method name, the params will be
-// unmarshaled into P, the handler will be called, and the returned R will be
-// marshaled as the JSON-RPC result.
-//
-// P and R must implement [Params] and [Result] respectively, which is most
-// easily done by embedding [ParamsBase] and [ResultBase].
-//
-// AddClientReceivingCustomMethod returns an error if method is the name of a
-// standard MCP method. Registering the same custom method twice replaces the
-// previous handler.
-func AddClientReceivingCustomMethod[P paramsPtr[T], R Result, T any](
-	c *Client,
-	method string,
-	handler func(ctx context.Context, cs *ClientSession, params P) (R, error),
-) error {
-	if _, ok := clientMethodInfos[method]; ok {
-		return fmt.Errorf("mcp: AddClientReceivingCustomMethod: %q shadows a standard MCP method", method)
-	}
-
-	typed := typedClientMethodHandler[P, R](func(ctx context.Context, req *ClientRequest[P]) (R, error) {
-		return handler(ctx, req.Session, req.Params)
-	})
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.receiveMethods[method] = newClientMethodInfo(typed, missingParamsOK)
-	return nil
 }

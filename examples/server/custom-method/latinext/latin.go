@@ -1,6 +1,6 @@
 // Copyright 2025 The Go MCP SDK Authors. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by the license
+// that can be found in the LICENSE file.
 
 // Package latinext is an example MCP extension that adds a "latin/translate"
 // custom JSON-RPC method. It demonstrates the extension-author pattern: types,
@@ -35,11 +35,9 @@ var Method = mcp.NewCustomMethod[*TranslateParams, *TranslateResult]("latin/tran
 func init() {
 	mcp.RegisterExtension(mcp.Extension{
 		Server: func(s *mcp.Server) error {
-			return Method.RegisterServerReceiving(s, DefaultHandler)
+			return Method.RegisterServer(s, DefaultHandler)
 		},
-		Client: func(c *mcp.Client) error {
-			return Method.RegisterClientSending(c)
-		},
+		Client: Method.RegisterClient,
 	})
 }
 

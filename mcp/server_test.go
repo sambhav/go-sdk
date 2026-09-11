@@ -1399,6 +1399,148 @@ func TestServerSessionHandle_RejectsInitializeOnNewProtocol(t *testing.T) {
 	})
 }
 
+func TestServerSessionHandle_SetsResultTypeOnNewProtocol(t *testing.T) {
+	server := NewServer(testImpl, &ServerOptions{
+		CompletionHandler: func(context.Context, *CompleteRequest) (*CompleteResult, error) {
+			return &CompleteResult{
+				Completion: CompletionResultDetails{
+					Values: []string{"go"},
+				},
+			}, nil
+		},
+	})
+	AddTool(server, &Tool{Name: "tool"}, func(context.Context, *CallToolRequest, struct{}) (*CallToolResult, any, error) {
+		return &CallToolResult{
+			InputRequests: InputRequestMap{"confirm": &ElicitParams{Message: "Continue?"}},
+		}, nil, nil
+	})
+	server.AddPrompt(&Prompt{Name: "prompt"}, func(context.Context, *GetPromptRequest) (*GetPromptResult, error) {
+		return &GetPromptResult{
+			InputRequests: InputRequestMap{"confirm": &ElicitParams{Message: "Continue?"}},
+		}, nil
+	})
+	server.AddResource(&Resource{URI: "test://resource", Name: "resource"}, func(context.Context, *ReadResourceRequest) (*ReadResourceResult, error) {
+		return &ReadResourceResult{
+			InputRequests: InputRequestMap{"confirm": &ElicitParams{Message: "Continue?"}},
+		}, nil
+	})
+	newProtocolParams := func(fields map[string]any) map[string]any {
+		params := map[string]any{
+			"_meta": map[string]any{
+				MetaKeyProtocolVersion:    protocolVersion20260728,
+				MetaKeyClientInfo:         map[string]any{"name": "c", "version": "1"},
+				MetaKeyClientCapabilities: map[string]any{},
+			},
+		}
+		for k, v := range fields {
+			params[k] = v
+		}
+		return params
+	}
+
+	tests := []struct {
+		name   string
+		method string
+		params map[string]any
+		want   resultType
+	}{
+		{
+			name:   "discover",
+			method: methodDiscover,
+			params: newProtocolParams(nil),
+			want:   resultTypeComplete,
+		},
+		{
+			name:   "tools list",
+			method: methodListTools,
+			params: newProtocolParams(nil),
+			want:   resultTypeComplete,
+		},
+		{
+			name:   "prompts list",
+			method: methodListPrompts,
+			params: newProtocolParams(nil),
+			want:   resultTypeComplete,
+		},
+		{
+			name:   "resources list",
+			method: methodListResources,
+			params: newProtocolParams(nil),
+			want:   resultTypeComplete,
+		},
+		{
+			name:   "resource templates list",
+			method: methodListResourceTemplates,
+			params: newProtocolParams(nil),
+			want:   resultTypeComplete,
+		},
+		{
+			name:   "complete",
+			method: methodComplete,
+			params: newProtocolParams(map[string]any{
+				"argument": map[string]any{
+					"name":  "language",
+					"value": "g",
+				},
+				"ref": map[string]any{
+					"type": "ref/prompt",
+					"name": "code_review",
+				},
+			}),
+			want: resultTypeComplete,
+		},
+		{
+			name:   "tool input required",
+			method: methodCallTool,
+			params: newProtocolParams(map[string]any{"name": "tool", "arguments": map[string]any{}}),
+			want:   resultTypeInputRequired,
+		},
+		{
+			name:   "prompt input required",
+			method: methodGetPrompt,
+			params: newProtocolParams(map[string]any{"name": "prompt"}),
+			want:   resultTypeInputRequired,
+		},
+		{
+			name:   "resource input required",
+			method: methodReadResource,
+			params: newProtocolParams(map[string]any{"uri": "test://resource"}),
+			want:   resultTypeInputRequired,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := &ServerSession{server: server}
+			id, err := jsonrpc.MakeID("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := ss.handle(context.Background(), &jsonrpc.Request{
+				ID:     id,
+				Method: tc.method,
+				Params: mustMarshal(tc.params),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				ResultType string `json:"resultType"`
+			}
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.ResultType != string(tc.want) {
+				t.Fatalf("resultType = %q, want %q; response = %s", got.ResultType, tc.want, data)
+			}
+		})
+	}
+}
+
 // TestServerSessionHandle_RejectsRemovedMethodsOnNewProtocol verifies that
 // the methods removed by SEP-2575 (`initialize`, `notifications/initialized`,
 // `ping`) all return Method not found when the request opts into the new
@@ -1449,5 +1591,344 @@ func TestServerSessionHandle_RejectsRemovedMethodsOnNewProtocol(t *testing.T) {
 				t.Errorf("method %q: message %q does not mention method name", tc.method, jerr.Message)
 			}
 		})
+	}
+}
+
+// TestServerSession_RejectsServerInitiatedRequests verifies that
+// SEP-2322 / SEP-2575 is enforced at the API surface: [ServerSession.Elicit],
+// [ServerSession.CreateMessage], [ServerSession.CreateMessageWithTools], and
+// [ServerSession.ListRoots] must refuse to send a server-to-client request
+// when the session is negotiated at protocol version >= 2026-07-28, and must
+// remain functional on pre-2026-07-28 sessions.
+func TestServerSession_RejectsServerInitiated(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		call func(*ServerSession) error
+	}{
+		{
+			name: "Elicit",
+			call: func(ss *ServerSession) error {
+				_, err := ss.Elicit(ctx, &ElicitParams{Message: "hi"})
+				return err
+			},
+		},
+		{
+			name: "CreateMessage",
+			call: func(ss *ServerSession) error {
+				_, err := ss.CreateMessage(ctx, &CreateMessageParams{})
+				return err
+			},
+		},
+		{
+			name: "CreateMessageWithTools",
+			call: func(ss *ServerSession) error {
+				_, err := ss.CreateMessageWithTools(ctx, &CreateMessageWithToolsParams{})
+				return err
+			},
+		},
+		{
+			name: "ListRoots",
+			call: func(ss *ServerSession) error {
+				_, err := ss.ListRoots(ctx, nil)
+				return err
+			},
+		},
+	}
+
+	// Cover both branches of the era gate: modern must reject, legacy must let
+	// the call proceed to the wire (where it either succeeds or fails on
+	// something unrelated to the guard, such as missing client capabilities).
+	for _, protoVer := range []string{protocolVersion20260728, protocolVersion20251125} {
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%s/%s", protoVer, tc.name), func(t *testing.T) {
+				ct, st := NewInMemoryTransports()
+				s := NewServer(testImpl, nil)
+				ss, err := s.Connect(ctx, st, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = ss.Close() })
+
+				// Client advertises every server-to-client capability so a
+				// legacy-era call is not rejected for capability reasons
+				// instead of era reasons.
+				c := NewClient(testImpl, &ClientOptions{
+					ElicitationHandler: func(context.Context, *ElicitRequest) (*ElicitResult, error) {
+						return &ElicitResult{Action: "cancel"}, nil
+					},
+					CreateMessageHandler: func(context.Context, *CreateMessageRequest) (*CreateMessageResult, error) {
+						return &CreateMessageResult{Model: "m", Role: "assistant", Content: &TextContent{Text: "ok"}}, nil
+					},
+				})
+				c.AddRoots(&Root{URI: "file:///workspace"})
+				cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protoVer})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = cs.Close() })
+
+				gotErr := tc.call(ss)
+				modern := protoVer >= protocolVersion20260728
+				if modern {
+					if gotErr == nil {
+						t.Fatalf("%s on %s: got nil error, want era-gate rejection", tc.name, protoVer)
+					}
+					wantSubstr := "cannot be sent while serving a request on protocol version " + protoVer
+					if !strings.Contains(gotErr.Error(), wantSubstr) {
+						t.Errorf("%s on %s: error %q does not contain %q", tc.name, protoVer, gotErr.Error(), wantSubstr)
+					}
+					if !strings.Contains(gotErr.Error(), "multi round-trip requests") {
+						t.Errorf("%s on %s: error %q does not steer to MRTR", tc.name, protoVer, gotErr.Error())
+					}
+				} else {
+					if gotErr != nil {
+						t.Errorf("%s on %s: got error %v, want nil (era gate must not fire on legacy)", tc.name, protoVer, gotErr)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestServerSetCacheable(t *testing.T) {
+	ctx := context.Background()
+	// The values an opinionated resource handler sets on its own result.
+	handlerValue := Cacheable{TTLMs: 9_000, CacheScope: "private"}
+
+	for _, tc := range []struct {
+		name        string
+		callback    func(context.Context, Request, *Cacheable)
+		wantSDK     Cacheable // for a result whose fields nobody set
+		wantHandler Cacheable // for a result the handler set fields on
+	}{
+		{
+			name:        "no callback",
+			wantSDK:     Cacheable{TTLMs: 0, CacheScope: "public"},
+			wantHandler: handlerValue,
+		},
+		{
+			name: "callback overrules the handler",
+			callback: func(_ context.Context, _ Request, c *Cacheable) {
+				c.TTLMs, c.CacheScope = 60_000, "private"
+			},
+			wantSDK:     Cacheable{TTLMs: 60_000, CacheScope: "private"},
+			wantHandler: Cacheable{TTLMs: 60_000, CacheScope: "private"},
+		},
+		{
+			// The callback is handed what the handler produced, so it can
+			// single out the results that expressed no opinion. The scope it
+			// leaves empty is still filled with the protocol default.
+			name: "callback defers to the handler",
+			callback: func(_ context.Context, _ Request, c *Cacheable) {
+				if c.CacheScope == "" {
+					c.TTLMs = 1_000
+				}
+			},
+			wantSDK:     Cacheable{TTLMs: 1_000, CacheScope: "public"},
+			wantHandler: handlerValue,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(testImpl, &ServerOptions{SetCacheable: tc.callback})
+			s.AddResource(&Resource{URI: "test://plain", Name: "plain"},
+				func(_ context.Context, req *ReadResourceRequest) (*ReadResourceResult, error) {
+					return &ReadResourceResult{Contents: []*ResourceContents{{URI: req.Params.URI, Text: "x"}}}, nil
+				})
+			s.AddResource(&Resource{URI: "test://opinionated", Name: "opinionated"},
+				func(_ context.Context, req *ReadResourceRequest) (*ReadResourceResult, error) {
+					return &ReadResourceResult{
+						Cacheable: handlerValue,
+						Contents:  []*ResourceContents{{URI: req.Params.URI, Text: "x"}},
+					}, nil
+				})
+			cs := mustConnect(t, s, nil)
+
+			check := func(label string, got, want Cacheable) {
+				t.Helper()
+				if got != want {
+					t.Errorf("%s Cacheable = %+v, want %+v", label, got, want)
+				}
+			}
+
+			tools, err := cs.ListTools(ctx, nil) // built by the SDK, never by a handler
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("tools/list", tools.Cacheable, tc.wantSDK)
+
+			for uri, want := range map[string]Cacheable{
+				"test://plain":       tc.wantSDK,
+				"test://opinionated": tc.wantHandler,
+			} {
+				res, err := cs.ReadResource(ctx, &ReadResourceParams{URI: uri})
+				if err != nil {
+					t.Fatal(err)
+				}
+				check(uri, res.Cacheable, want)
+			}
+		})
+	}
+}
+
+// TestServerSupportedProtocolVersions verifies that
+// [ServerOptions.SupportedProtocolVersions] narrows both the versions the
+// server advertises in server/discover and the versions it negotiates,
+// and that it cannot widen SDK support.
+func TestServerSupportedProtocolVersions(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("discover advertises the configured subset", func(t *testing.T) {
+		server := NewServer(testImpl, &ServerOptions{
+			// Deliberately unordered: the server must advertise newest first.
+			SupportedProtocolVersions: []string{protocolVersion20251125, protocolVersion20260728},
+		})
+		var advertised []string
+		server.AddReceivingMiddleware(func(next MethodHandler) MethodHandler {
+			return func(ctx context.Context, method string, req Request) (Result, error) {
+				res, err := next(ctx, method, req)
+				if method == methodDiscover && err == nil {
+					advertised = res.(*DiscoverResult).SupportedVersions
+				}
+				return res, err
+			}
+		})
+
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatalf("server.Connect: %v", err)
+		}
+		defer ss.Close()
+
+		cs, err := NewClient(testImpl, nil).Connect(ctx, ct, &ClientSessionOptions{
+			ProtocolVersion: protocolVersion20260728,
+		})
+		if err != nil {
+			t.Fatalf("client.Connect: %v", err)
+		}
+		defer cs.Close()
+
+		want := []string{protocolVersion20260728, protocolVersion20251125}
+		if diff := cmp.Diff(want, advertised); diff != "" {
+			t.Errorf("DiscoverResult.SupportedVersions mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("initialize negotiates within the configured subset", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			supported []string
+			client    string
+			want      string
+		}{
+			{
+				name:      "requested version supported",
+				supported: []string{protocolVersion20251125, protocolVersion20250618},
+				client:    protocolVersion20250618,
+				want:      protocolVersion20250618,
+			},
+			{
+				name:      "requested version excluded",
+				supported: []string{protocolVersion20251125, protocolVersion20250618},
+				client:    protocolVersion20241105,
+				want:      protocolVersion20251125,
+			},
+			{
+				name:      "fallback is the newest configured version",
+				supported: []string{protocolVersion20250326},
+				client:    protocolVersion20241105,
+				want:      protocolVersion20250326,
+			},
+			{
+				// Nothing the server supports can carry an initialize
+				// handshake, so the answer names a handshake-era version the
+				// client can act on rather than one it could mistake for the
+				// new protocol.
+				name:      "server with no handshake version",
+				supported: []string{protocolVersion20260728},
+				client:    protocolVersion20250618,
+				want:      protocolVersion20251125,
+			},
+			{
+				name:      "unrestricted server keeps the default behavior",
+				supported: nil,
+				client:    protocolVersion20241105,
+				want:      protocolVersion20241105,
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				server := NewServer(testImpl, &ServerOptions{SupportedProtocolVersions: test.supported})
+				ct, st := NewInMemoryTransports()
+				ss, err := server.Connect(ctx, st, nil)
+				if err != nil {
+					t.Fatalf("server.Connect: %v", err)
+				}
+				defer ss.Close()
+
+				cs, err := NewClient(testImpl, nil).Connect(ctx, ct, &ClientSessionOptions{
+					ProtocolVersion: test.client,
+				})
+				if err != nil {
+					t.Fatalf("client.Connect: %v", err)
+				}
+				defer cs.Close()
+
+				if got := cs.InitializeResult().ProtocolVersion; got != test.want {
+					t.Errorf("negotiated protocol version = %q, want %q", got, test.want)
+				}
+			})
+		}
+	})
+
+	t.Run("unknown version panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("NewServer did not panic on an unsupported protocol version")
+			}
+		}()
+		NewServer(testImpl, &ServerOptions{SupportedProtocolVersions: []string{"1999-01-01"}})
+	})
+}
+
+// TestServerSupportedProtocolVersions_NewProtocol verifies that a request
+// using the SEP-2575 per-request protocol is rejected with
+// [CodeUnsupportedProtocolVersion] when its version is excluded by
+// [ServerOptions.SupportedProtocolVersions].
+func TestServerSupportedProtocolVersions_NewProtocol(t *testing.T) {
+	ctx := context.Background()
+	server := NewServer(testImpl, &ServerOptions{
+		SupportedProtocolVersions: []string{protocolVersion20251125},
+	})
+	ct, st := NewInMemoryTransports()
+	ss, err := server.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatalf("server.Connect: %v", err)
+	}
+	defer ss.Close()
+	_ = ct
+
+	params := fmt.Sprintf(`{"_meta":{%q:%q,%q:{}}}`,
+		MetaKeyProtocolVersion, protocolVersion20260728, MetaKeyClientCapabilities)
+	_, err = ss.handle(ctx, &jsonrpc.Request{
+		ID:     jsonrpc2.Int64ID(1),
+		Method: methodListTools,
+		Params: json.RawMessage(params),
+	})
+	var jerr *jsonrpc.Error
+	if !errors.As(err, &jerr) {
+		t.Fatalf("handle returned %v, want a *jsonrpc.Error", err)
+	}
+	if jerr.Code != CodeUnsupportedProtocolVersion {
+		t.Fatalf("error code = %d, want %d", jerr.Code, CodeUnsupportedProtocolVersion)
+	}
+	var data UnsupportedProtocolVersionData
+	if err := json.Unmarshal(jerr.Data, &data); err != nil {
+		t.Fatalf("unmarshal error data: %v", err)
+	}
+	if diff := cmp.Diff([]string{protocolVersion20251125}, data.Supported); diff != "" {
+		t.Errorf("UnsupportedProtocolVersionData.Supported mismatch (-want +got):\n%s", diff)
 	}
 }

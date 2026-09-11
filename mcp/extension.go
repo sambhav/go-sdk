@@ -1,6 +1,6 @@
 // Copyright 2025 The Go MCP SDK Authors. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by the license
+// that can be found in the LICENSE file.
 
 package mcp
 
@@ -10,35 +10,20 @@ import (
 	"sync"
 )
 
-// CustomMethod captures the method name and parameter/result types for a
-// custom JSON-RPC method. Extension authors define a package-level var using
-// [NewCustomMethod]; consumers call the resulting methods without ever writing
-// generic type parameters or method-name strings.
-//
-// For the client-to-server direction:
+// CustomMethod describes a custom client-to-server JSON-RPC method. Define it
+// once with [NewCustomMethod] to reuse its name and types for registration and calls:
 //
 //	var Method = mcp.NewCustomMethod[*MyParams, *MyResult]("acme/method")
 //
-//	// Extension author wires server and client once:
-//	Method.RegisterServerReceiving(server, MyHandler)
-//	Method.RegisterClientSending(client)
-//
-//	// Consumer calls with no generics visible:
+//	err := Method.RegisterServer(server, MyHandler)
+//	err = Method.RegisterClient(client)
 //	result, err := Method.Call(ctx, cs, &MyParams{...})
-//
-// For the server-to-client direction use [CustomMethod.RegisterServerSending],
-// [CustomMethod.RegisterClientReceiving], and [CustomMethod.ServerCall].
-//
-// P, R, and T are phantom type parameters — they are not stored in the struct
-// but thread through to the wrapped generic functions so call sites stay
-// type-safe without repeating type arguments.
 type CustomMethod[P paramsPtr[T], R Result, T any] struct {
 	name string
 }
 
 // NewCustomMethod creates a [CustomMethod] that captures the method name and
-// its parameter and result types. The name must not be the name of a standard
-// MCP method.
+// its parameter and result types. Registration rejects standard MCP method names.
 func NewCustomMethod[P paramsPtr[T], R Result, T any](name string) *CustomMethod[P, R, T] {
 	return &CustomMethod[P, R, T]{name: name}
 }
@@ -46,42 +31,22 @@ func NewCustomMethod[P paramsPtr[T], R Result, T any](name string) *CustomMethod
 // Name returns the JSON-RPC method name.
 func (m *CustomMethod[P, R, T]) Name() string { return m.name }
 
-// RegisterServerReceiving registers handler on s to handle incoming requests
-// for this method from clients. It wraps [AddReceivingCustomMethod].
-func (m *CustomMethod[P, R, T]) RegisterServerReceiving(s *Server, handler func(ctx context.Context, ss *ServerSession, params P) (R, error)) error {
+// RegisterServer registers handler on s using [AddReceivingCustomMethod].
+// Registering the same custom method again replaces its handler.
+func (m *CustomMethod[P, R, T]) RegisterServer(s *Server, handler func(ctx context.Context, ss *ServerSession, params P) (R, error)) error {
 	return AddReceivingCustomMethod(s, m.name, handler)
 }
 
-// RegisterServerSending registers this method on s so that the server may
-// call clients via [CustomMethod.ServerCall]. It wraps
-// [AddServerSendingCustomMethod].
-func (m *CustomMethod[P, R, T]) RegisterServerSending(s *Server) error {
-	return AddServerSendingCustomMethod[P, R](s, m.name)
-}
-
-// RegisterClientSending registers this method on c so that the client may
-// send it to a server via [CustomMethod.Call]. It wraps [AddSendingCustomMethod].
-func (m *CustomMethod[P, R, T]) RegisterClientSending(c *Client) error {
+// RegisterClient registers this method on c using [AddSendingCustomMethod],
+// so its sessions can invoke [CustomMethod.Call].
+func (m *CustomMethod[P, R, T]) RegisterClient(c *Client) error {
 	return AddSendingCustomMethod[P, R](c, m.name)
 }
 
-// RegisterClientReceiving registers handler on c to handle incoming requests
-// for this method from servers. It wraps [AddClientReceivingCustomMethod].
-func (m *CustomMethod[P, R, T]) RegisterClientReceiving(c *Client, handler func(ctx context.Context, cs *ClientSession, params P) (R, error)) error {
-	return AddClientReceivingCustomMethod(c, m.name, handler)
-}
-
 // Call invokes this method on the server via cs. It wraps [CallCustomMethod].
-// The method must have been registered on the client via [CustomMethod.RegisterClientSending].
+// The method must have been registered on the client via [CustomMethod.RegisterClient].
 func (m *CustomMethod[P, R, T]) Call(ctx context.Context, cs *ClientSession, params P) (R, error) {
 	return CallCustomMethod[P, R](ctx, cs, m.name, params)
-}
-
-// ServerCall invokes this method on the client via ss. It wraps
-// [ServerCallCustomMethod]. The method must have been registered on the server
-// via [CustomMethod.RegisterServerSending].
-func (m *CustomMethod[P, R, T]) ServerCall(ctx context.Context, ss *ServerSession, params P) (R, error) {
-	return ServerCallCustomMethod[P, R](ctx, ss, m.name, params)
 }
 
 // Extension describes a set of custom methods that can be auto-applied to
@@ -113,29 +78,19 @@ var (
 // RegisterExtension is safe for concurrent use and is typically called from
 // init functions. For scoped registration that does not affect the whole
 // process, use [ServerOptions.Extensions] / [ClientOptions.Extensions] instead.
+// Registration does not affect existing clients or servers.
 func RegisterExtension(ext Extension) {
 	extensionsMu.Lock()
 	defer extensionsMu.Unlock()
 	extensions = append(extensions, ext)
 }
 
-func applyExtensionsToServer(s *Server) {
-	applyExtensions(func(e Extension) func(*Server) error { return e.Server }, s)
-}
-
-func applyExtensionsToClient(c *Client) {
-	applyExtensions(func(e Extension) func(*Client) error { return e.Client }, c)
-}
-
-func applyExtensions[T any](get func(Extension) func(T) error, arg T) {
+func applyExtensions[T any](local []Extension, get func(Extension) func(T) error, arg T) {
 	extensionsMu.Lock()
 	exts := append([]Extension(nil), extensions...)
 	extensionsMu.Unlock()
-	runExtensions(exts, get, arg)
-}
-
-func runExtensions[T any](exts []Extension, get func(Extension) func(T) error, arg T) {
-	for _, ext := range exts {
+	// Apply callbacks outside the lock so they may register other extensions.
+	for _, ext := range append(exts, local...) {
 		if fn := get(ext); fn != nil {
 			if err := fn(arg); err != nil {
 				panic(fmt.Errorf("mcp: applying extension: %w", err))

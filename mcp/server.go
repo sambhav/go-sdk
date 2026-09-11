@@ -27,6 +27,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	internaljson "github.com/modelcontextprotocol/go-sdk/internal/json"
 	"github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2"
+	"github.com/modelcontextprotocol/go-sdk/internal/mcpgodebug"
 	"github.com/modelcontextprotocol/go-sdk/internal/util"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/yosida95/uritemplate/v3"
@@ -43,6 +44,10 @@ type Server struct {
 	// fixed at creation
 	impl *Implementation
 	opts ServerOptions
+	// protocolVersions is the descending-ordered list of protocol versions
+	// this server advertises and negotiates: [supportedProtocolVersions],
+	// narrowed by [ServerOptions.SupportedProtocolVersions].
+	protocolVersions []string
 
 	mu                          sync.Mutex
 	prompts                     *featureSet[*serverPrompt]
@@ -62,11 +67,6 @@ type Server struct {
 	// serverMethodInfos) plus any custom methods registered via
 	// [AddReceivingCustomMethod].
 	receiveMethods map[string]methodInfo
-	// sendMethods is the merged map of methods this server may send to a
-	// client: it always contains the standard client methods (from
-	// clientMethodInfos) plus any custom methods registered via
-	// [AddServerSendingCustomMethod].
-	sendMethods map[string]methodInfo
 }
 
 // ServerOptions is used to configure behavior of the server.
@@ -173,14 +173,40 @@ type ServerOptions struct {
 	// GetSessionID is not consulted when [StreamableHTTPOptions.Stateless] is
 	// true, since stateless servers do not maintain sessions.
 	GetSessionID func() string
-	// Extensions are applied to the server during [NewServer], after any
-	// globally registered extensions (see [RegisterExtension]). Per-server
-	// extensions override global ones for the same method names.
+
+	// SetCacheable, if non-nil, decides the cache-control fields (ttlMs and
+	// cacheScope) of every result that carries them: server/discover, the
+	// four list methods, and resources/read.
+	//
+	// It is called once per such result, after the corresponding handler has
+	// returned, with c holding the values that handler produced.
+	SetCacheable func(ctx context.Context, req Request, c *Cacheable)
+
+	// SupportedProtocolVersions, if non-empty, restricts the protocol versions
+	// this server advertises. If empty, every version returned by
+	// [SupportedProtocolVersions] is used.
+	// The list can only narrow support, never widen it.
+	// A request using the >= 2026-07-28 protocol at an excluded version is
+	// rejected with error code [CodeUnsupportedProtocolVersion].
+	//
+	// The legacy initialize handshake never rejects. The lifecycle spec
+	// requires the server to answer a request it does not support with a
+	// version it does, so an excluded version is answered with the newest
+	// listed version that handshake can negotiate, and the client is expected
+	// to disconnect when it cannot speak it. A list holding no such version
+	// (one restricted to 2026-07-28 and later) is answered with 2025-11-25,
+	// the newest handshake-era version, so that the client disconnects rather
+	// than reading the answer as a negotiation into the new protocol.
+	SupportedProtocolVersions []string
+
+	// Extensions are applied in order during [NewServer], after globally
+	// registered extensions (see [RegisterExtension]). Later registrations
+	// of the same custom method replace earlier ones.
 	Extensions []Extension
 }
 
-// NewServer creates a new MCP server. The resulting server has no features:
-// add features using the various Server.AddXXX methods, and the [AddTool] function.
+// NewServer creates a new MCP server and applies registered extensions.
+// Add features using the various Server.AddXXX methods and the [AddTool] function.
 //
 // The server can be connected to one or more MCP clients using [Server.Run].
 //
@@ -213,6 +239,18 @@ func NewServer(impl *Implementation, options *ServerOptions) *Server {
 		opts.GetSessionID = rand.Text
 	}
 
+	protocolVersions := SupportedProtocolVersions()
+	if len(opts.SupportedProtocolVersions) > 0 {
+		for _, v := range opts.SupportedProtocolVersions {
+			if !slices.Contains(supportedProtocolVersions, v) {
+				panic(fmt.Errorf("unsupported protocol version %q", v))
+			}
+		}
+		protocolVersions = slices.DeleteFunc(protocolVersions, func(v string) bool {
+			return !slices.Contains(opts.SupportedProtocolVersions, v)
+		})
+	}
+
 	if opts.Logger == nil { // ensure we have a logger
 		opts.Logger = ensureLogger(nil)
 	}
@@ -220,12 +258,10 @@ func NewServer(impl *Implementation, options *ServerOptions) *Server {
 	receiveMethods := make(map[string]methodInfo, len(serverMethodInfos))
 	maps.Copy(receiveMethods, serverMethodInfos)
 
-	sendMethods := make(map[string]methodInfo, len(clientMethodInfos))
-	maps.Copy(sendMethods, clientMethodInfos)
-
 	s := &Server{
 		impl:                        impl,
 		opts:                        opts,
+		protocolVersions:            protocolVersions,
 		prompts:                     newFeatureSet(func(p *serverPrompt) string { return p.prompt.Name }),
 		tools:                       newFeatureSet(func(t *serverTool) string { return t.tool.Name }),
 		resources:                   newFeatureSet(func(r *serverResource) string { return r.resource.URI }),
@@ -238,11 +274,9 @@ func NewServer(impl *Implementation, options *ServerOptions) *Server {
 		resourceSubscriptions:       make(map[string]map[*ServerSession]jsonrpc.ID),
 		pendingNotifications:        make(map[string]*time.Timer),
 		receiveMethods:              receiveMethods,
-		sendMethods:                 sendMethods,
 	}
 	s.AddReceivingMiddleware(serverMultiRoundTripMiddleware())
-	applyExtensionsToServer(s)
-	runExtensions(opts.Extensions, func(e Extension) func(*Server) error { return e.Server }, s)
+	applyExtensions(opts.Extensions, func(e Extension) func(*Server) error { return e.Server }, s)
 	return s
 }
 
@@ -676,7 +710,23 @@ func (s *Server) capabilities() *ServerCapabilities {
 	return caps
 }
 
+// disablecompleteparamsvalidation is a compatibility parameter that restores
+// the previous behavior of [Server.complete], where required fields on
+// [CompleteParams] were not validated before dispatching to the completion
+// handler. See the documentation for the mcpgodebug package for instructions
+// how to enable it.
+// The option will be removed in a future version of the SDK.
+var disablecompleteparamsvalidation = mcpgodebug.Value("disablecompleteparamsvalidation")
+
 func (s *Server) complete(ctx context.Context, req *CompleteRequest) (*CompleteResult, error) {
+	if disablecompleteparamsvalidation != "1" {
+		if req.Params.Ref == nil {
+			return nil, fmt.Errorf("%w: missing required 'ref' field", jsonrpc2.ErrInvalidParams)
+		}
+		if req.Params.Argument.Name == "" {
+			return nil, fmt.Errorf("%w: missing required 'argument.name' field", jsonrpc2.ErrInvalidParams)
+		}
+	}
 	if s.opts.CompletionHandler == nil {
 		return nil, jsonrpc2.ErrMethodNotFound
 	}
@@ -834,7 +884,7 @@ func (s *Server) Sessions() iter.Seq[*ServerSession] {
 	return slices.Values(clients)
 }
 
-func (s *Server) listPrompts(_ context.Context, req *ListPromptsRequest) (*ListPromptsResult, error) {
+func (s *Server) listPrompts(ctx context.Context, req *ListPromptsRequest) (*ListPromptsResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Params == nil {
@@ -849,7 +899,7 @@ func (s *Server) listPrompts(_ context.Context, req *ListPromptsRequest) (*ListP
 	if err != nil {
 		return nil, err
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	return res, nil
 }
 
@@ -879,40 +929,52 @@ func (s *Server) getPrompt(ctx context.Context, req *GetPromptRequest) (*GetProm
 // the server's capabilities, the server's identity, and the server's
 // instructions, allowing clients to negotiate without performing the legacy
 // initialize handshake.
-func (s *Server) discover(_ context.Context, req *ServerRequest[*DiscoverParams]) (*DiscoverResult, error) {
+func (s *Server) discover(ctx context.Context, req *ServerRequest[*DiscoverParams]) (*DiscoverResult, error) {
 	req.Session.mu.Lock()
 	versions := req.Session.supportedVersions
 	req.Session.mu.Unlock()
 	if versions == nil {
-		versions = slices.Clone(supportedProtocolVersions)
+		versions = slices.Clone(s.protocolVersions)
 	}
-	req.Session.updateState(func(state *ServerSessionState) {
-		state.InitializeParams = &InitializeParams{
-			ProtocolVersion: req.ProtocolVersion(),
-			Capabilities:    req.ClientCapabilities(),
-			ClientInfo:      req.ClientInfo(),
-		}
-	})
+	// Read the request-scoped identity/capabilities before acquiring the
+	// session lock: these accessors may fall back to Session.InitializeParams
+	// (which also locks Session.mu), so calling them from inside updateState
+	// would self-deadlock.
+	init := &InitializeParams{
+		ProtocolVersion: req.ProtocolVersion(),
+		Capabilities:    req.ClientCapabilities(),
+		ClientInfo:      req.ClientInfo(),
+	}
+	// Only persist InitializeParams when the transport can actually serve
+	// the new protocol. On transports that cannot (notably stateful
+	// StreamableHTTPHandler), a discover request creates a session that
+	// is never surfaced to the client via Mcp-Session-Id; leaving
+	// InitializeParams nil lets serveStatefulPOST's safety-net cleanup
+	// close it instead of leaking.
+	if slices.ContainsFunc(versions, func(v string) bool { return v >= protocolVersion20260728 }) {
+		req.Session.updateState(func(state *ServerSessionState) {
+			state.InitializeParams = init
+		})
+	}
 	res := &DiscoverResult{
 		SupportedVersions: versions,
 		Capabilities:      s.capabilities(),
-		ServerInfo:        s.impl,
 		Instructions:      s.opts.Instructions,
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	return res, nil
 }
 
-// filterSupportedVersions returns the subset of [supportedProtocolVersions]
-// that the Transport can serve. If t does not implement [ProtocolVersionSupporter], every
-// SDK-supported version is included.
-func filterSupportedVersions(t Transport) []string {
+// filterSupportedVersions returns the subset of versions that the Transport
+// can serve. If t does not implement [ProtocolVersionSupporter], every version
+// is included.
+func filterSupportedVersions(t Transport, versions []string) []string {
 	pvs, ok := t.(ProtocolVersionSupporter)
 	if !ok {
-		return slices.Clone(supportedProtocolVersions)
+		return slices.Clone(versions)
 	}
-	out := make([]string, 0, len(supportedProtocolVersions))
-	for _, v := range supportedProtocolVersions {
+	out := make([]string, 0, len(versions))
+	for _, v := range versions {
 		if pvs.SupportsProtocolVersion(v) {
 			out = append(out, v)
 		}
@@ -920,7 +982,7 @@ func filterSupportedVersions(t Transport) []string {
 	return out
 }
 
-func (s *Server) listTools(_ context.Context, req *ListToolsRequest) (*ListToolsResult, error) {
+func (s *Server) listTools(ctx context.Context, req *ListToolsRequest) (*ListToolsResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Params == nil {
@@ -935,7 +997,7 @@ func (s *Server) listTools(_ context.Context, req *ListToolsRequest) (*ListTools
 	if err != nil {
 		return nil, err
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	return res, nil
 }
 
@@ -968,7 +1030,7 @@ func (s *Server) callTool(ctx context.Context, req *CallToolRequest) (*CallToolR
 	return res, err
 }
 
-func (s *Server) listResources(_ context.Context, req *ListResourcesRequest) (*ListResourcesResult, error) {
+func (s *Server) listResources(ctx context.Context, req *ListResourcesRequest) (*ListResourcesResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Params == nil {
@@ -983,11 +1045,11 @@ func (s *Server) listResources(_ context.Context, req *ListResourcesRequest) (*L
 	if err != nil {
 		return nil, err
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	return res, nil
 }
 
-func (s *Server) listResourceTemplates(_ context.Context, req *ListResourceTemplatesRequest) (*ListResourceTemplatesResult, error) {
+func (s *Server) listResourceTemplates(ctx context.Context, req *ListResourceTemplatesRequest) (*ListResourceTemplatesResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Params == nil {
@@ -1003,7 +1065,7 @@ func (s *Server) listResourceTemplates(_ context.Context, req *ListResourceTempl
 	if err != nil {
 		return nil, err
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	return res, nil
 }
 
@@ -1021,14 +1083,17 @@ func (s *Server) readResource(ctx context.Context, req *ReadResourceRequest) (*R
 	if err != nil {
 		return nil, err
 	}
+	if res == nil {
+		return nil, fmt.Errorf("reading resource %s: read handler returned nil information", uri)
+	}
 	if err := handleMultiRoundTripResult(req.Session, s.opts.Logger, res); err != nil {
 		return nil, err
 	}
-	res.setDefaultCacheableValues()
+	s.resolveCacheable(ctx, req, &res.Cacheable)
 	if res.resultType == resultTypeInputRequired {
 		return res, nil
 	}
-	if res == nil || res.Contents == nil {
+	if res.Contents == nil {
 		return nil, fmt.Errorf("reading resource %s: read handler returned nil information", uri)
 	}
 	// As a convenience, populate some fields.
@@ -1041,6 +1106,22 @@ func (s *Server) readResource(ctx context.Context, req *ReadResourceRequest) (*R
 		}
 	}
 	return res, nil
+}
+
+// resolveCacheable settles the cache-control fields of an outgoing result.
+//
+// On entry c holds whatever the feature handler produced, which is the zero
+// value for results the SDK builds itself. [ServerOptions.SetCacheable] may
+// then rewrite it, and any cacheScope still unset is filled with the protocol
+// default.
+//
+// The list methods call this with s.mu held, so SetCacheable must not call
+// back into the server; see its documentation.
+func (s *Server) resolveCacheable(ctx context.Context, req Request, c *Cacheable) {
+	if s.opts.SetCacheable != nil {
+		s.opts.SetCacheable(ctx, req, c)
+	}
+	c.normalize()
 }
 
 // lookupResourceHandler returns the resource handler and MIME type for the resource or
@@ -1178,10 +1259,14 @@ func (s *Server) unsubscribe(ctx context.Context, req *UnsubscribeRequest) (*emp
 	return &emptyResult{}, nil
 }
 
-func (s *Server) subscriptionsListen(ctx context.Context, req *SubscriptionsListenRequest) (*emptyResult, error) {
+func (s *Server) subscriptionsListen(ctx context.Context, req *SubscriptionsListenRequest) (*SubscriptionsListenResult, error) {
 	requestID, ok := ctx.Value(idContextKey{}).(jsonrpc.ID)
 	if !ok || !requestID.IsValid() {
 		return nil, fmt.Errorf("%w: subscriptions/listen requires a request ID", jsonrpc2.ErrInvalidRequest)
+	}
+
+	if req.Params.Notifications == nil {
+		return nil, fmt.Errorf("%w: missing required 'notifications' field", jsonrpc2.ErrInvalidParams)
 	}
 
 	allowed := s.allowedSubscriptions(req.Params.Notifications)
@@ -1232,11 +1317,16 @@ func (s *Server) subscriptionsListen(ctx context.Context, req *SubscriptionsList
 		return nil, fmt.Errorf("sending subscriptions/acknowledged: %w", err)
 	}
 
-	<-ctx.Done()
-	return &emptyResult{}, nil
+	// If there are any active subscriptions, we block until the context is cancelled. Otherwise, we return immediately.
+	if len(allowed.ResourceSubscriptions) > 0 || allowed.ToolsListChanged || allowed.PromptsListChanged || allowed.ResourcesListChanged {
+		<-ctx.Done()
+	}
+	return &SubscriptionsListenResult{
+		Meta: Meta{MetaKeySubscriptionID: requestID.Raw()},
+	}, nil
 }
 
-func (s *Server) allowedSubscriptions(want NotificationSubscriptions) NotificationSubscriptions {
+func (s *Server) allowedSubscriptions(want *NotificationSubscriptions) NotificationSubscriptions {
 	caps := s.capabilities()
 	agreed := NotificationSubscriptions{}
 	if want.ToolsListChanged && caps.Tools != nil && caps.Tools.ListChanged {
@@ -1372,7 +1462,7 @@ func (s *Server) Connect(ctx context.Context, t Transport, opts *ServerSessionOp
 	// but without the lock the Go memory model gives the read goroutine no
 	// guarantee of seeing this write, and -race flags it.
 	ss.mu.Lock()
-	ss.supportedVersions = filterSupportedVersions(t)
+	ss.supportedVersions = filterSupportedVersions(t, s.protocolVersions)
 	ss.mu.Unlock()
 
 	// Start keepalive before returning the session to avoid race conditions with Close.
@@ -1466,7 +1556,7 @@ type ServerSession struct {
 	mcpConn         Connection
 	keepaliveCancel context.CancelFunc
 
-	// supportedVersions is the subset of [supportedProtocolVersions] that the
+	// supportedVersions is the subset of [Server.protocolVersions] that the
 	// transport can actually serve, computed once at connection time from
 	// [ProtocolVersionSupporter] (if implemented by the transport) and used by
 	// the SEP-2575 server/discover handler.
@@ -1474,6 +1564,12 @@ type ServerSession struct {
 
 	mu    sync.Mutex
 	state ServerSessionState
+	// listenIDs holds the request IDs of in-flight subscriptions/listen
+	// handlers on this session. subscriptions/listen parks on ctx.Done until
+	// cancelled, so ServerSession.Close must cancel these contexts explicitly
+	// via jsonrpc2.Connection.Cancel to avoid deadlocking on the jsonrpc2
+	// drain. See modelcontextprotocol/go-sdk#1160.
+	listenIDs []jsonrpc.ID
 }
 
 func (ss *ServerSession) updateState(mut func(*ServerSessionState)) {
@@ -1520,6 +1616,23 @@ func (ss *ServerSession) ID() string {
 	return ""
 }
 
+// assertServerInitiatedRequestAllowed returns an error when the session is
+// negotiated at protocol version >= 2026-07-28, where the spec (SEP-2322 /
+// SEP-2575) forbids server-initiated JSON-RPC requests for elicitation,
+// sampling, and roots: those interactions MUST be embedded as [InputRequests]
+// in an [InputRequiredResult] returned from a handler for one of the multi
+// round-trip methods (`tools/call`, `prompts/get`, `resources/read`).
+func (ss *ServerSession) assertServerInitiatedRequestAllowed(method string) error {
+	if iparams := ss.InitializeParams(); iparams != nil &&
+		iparams.ProtocolVersion >= protocolVersion20260728 {
+		return fmt.Errorf(
+			"%q cannot be sent while serving a request on protocol version %s: "+
+				"return an InputRequests map instead (multi round-trip requests, SEP-2322)",
+			method, iparams.ProtocolVersion)
+	}
+	return nil
+}
+
 // Ping pings the client.
 func (ss *ServerSession) Ping(ctx context.Context, params *PingParams) error {
 	_, err := handleSend[*emptyResult](ctx, methodPing, newServerRequest(ss, orZero[Params](params)))
@@ -1535,6 +1648,9 @@ func (ss *ServerSession) Ping(ctx context.Context, params *PingParams) error {
 // https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging.
 func (ss *ServerSession) ListRoots(ctx context.Context, params *ListRootsParams) (*ListRootsResult, error) {
 	if err := ss.checkInitialized(methodListRoots); err != nil {
+		return nil, err
+	}
+	if err := ss.assertServerInitiatedRequestAllowed(methodListRoots); err != nil {
 		return nil, err
 	}
 	return handleSend[*ListRootsResult](ctx, methodListRoots, newServerRequest(ss, orZero[Params](params)))
@@ -1553,6 +1669,9 @@ func (ss *ServerSession) ListRoots(ctx context.Context, params *ListRootsParams)
 // https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging.
 func (ss *ServerSession) CreateMessage(ctx context.Context, params *CreateMessageParams) (*CreateMessageResult, error) {
 	if err := ss.checkInitialized(methodCreateMessage); err != nil {
+		return nil, err
+	}
+	if err := ss.assertServerInitiatedRequestAllowed(methodCreateMessage); err != nil {
 		return nil, err
 	}
 	if params == nil {
@@ -1598,6 +1717,9 @@ func (ss *ServerSession) CreateMessageWithTools(ctx context.Context, params *Cre
 	if err := ss.checkInitialized(methodCreateMessage); err != nil {
 		return nil, err
 	}
+	if err := ss.assertServerInitiatedRequestAllowed(methodCreateMessage); err != nil {
+		return nil, err
+	}
 	if params == nil {
 		params = &CreateMessageWithToolsParams{Messages: []*SamplingMessageV2{}}
 	}
@@ -1614,19 +1736,14 @@ func (ss *ServerSession) Elicit(ctx context.Context, params *ElicitParams) (*Eli
 	if err := ss.checkInitialized(methodElicit); err != nil {
 		return nil, err
 	}
+	if err := ss.assertServerInitiatedRequestAllowed(methodElicit); err != nil {
+		return nil, err
+	}
 	if params == nil {
 		return nil, fmt.Errorf("%w: params cannot be nil", jsonrpc2.ErrInvalidParams)
 	}
 
-	if params.Mode == "" {
-		params2 := *params
-		if params.URL != "" || params.ElicitationID != "" {
-			params2.Mode = "url"
-		} else {
-			params2.Mode = "form"
-		}
-		params = &params2
-	}
+	params = params.inferElicitMode()
 
 	if iparams := ss.InitializeParams(); iparams == nil || iparams.Capabilities == nil || iparams.Capabilities.Elicitation == nil {
 		return nil, fmt.Errorf("client does not support elicitation")
@@ -1650,7 +1767,7 @@ func (ss *ServerSession) Elicit(ctx context.Context, params *ElicitParams) (*Eli
 		return nil, err
 	}
 
-	if res.Action != "accept" {
+	if res.Action != "accept" || res.Content == nil {
 		return res, nil
 	}
 
@@ -1680,6 +1797,18 @@ func (ss *ServerSession) Elicit(ctx context.Context, params *ElicitParams) (*Eli
 	return res, nil
 }
 
+// NotifyElicitationComplete tells the client that the out-of-band ("url" mode)
+// elicitation identified by params.ElicitationID has finished.
+func (ss *ServerSession) NotifyElicitationComplete(ctx context.Context, params *ElicitationCompleteParams) error {
+	if params == nil {
+		return fmt.Errorf("%w: params cannot be nil", jsonrpc2.ErrInvalidParams)
+	}
+	if params.ElicitationID == "" {
+		return fmt.Errorf("%w: ElicitationID cannot be empty", jsonrpc2.ErrInvalidParams)
+	}
+	return handleNotify(ctx, notificationElicitationComplete, newServerRequest(ss, orZero[Params](params)))
+}
+
 // Log sends a log message to the client.
 //
 // For new-protocol (>= 2026-07-28) requests, the level is taken from the
@@ -1692,9 +1821,12 @@ func (ss *ServerSession) Elicit(ctx context.Context, params *ElicitParams) (*Eli
 // (at least twelve months). See
 // https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging.
 func (ss *ServerSession) Log(ctx context.Context, params *LoggingMessageParams) error {
-	ss.mu.Lock()
-	logLevel := ss.state.LogLevel
-	ss.mu.Unlock()
+	logLevel, ok := logLevelFromContext(ctx)
+	if !ok {
+		ss.mu.Lock()
+		logLevel = ss.state.LogLevel
+		ss.mu.Unlock()
+	}
 	if logLevel == "" {
 		// The spec is unclear, but seems to imply that no log messages are sent until the client
 		// sets the level.
@@ -1783,12 +1915,7 @@ func initializeMethodInfo() methodInfo {
 	return info
 }
 
-func (ss *ServerSession) sendingMethodInfos() map[string]methodInfo {
-	s := ss.server
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sendMethods
-}
+func (ss *ServerSession) sendingMethodInfos() map[string]methodInfo { return clientMethodInfos }
 
 func (s *Server) receivingMethodInfos() map[string]methodInfo {
 	s.mu.Lock()
@@ -1833,9 +1960,9 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 	}
 
 	if validatedMeta.usesNewProtocol &&
-		!slices.Contains(supportedProtocolVersions, validatedMeta.initializeParams.ProtocolVersion) {
+		!slices.Contains(ss.server.protocolVersions, validatedMeta.initializeParams.ProtocolVersion) {
 		data, _ := json.Marshal(UnsupportedProtocolVersionData{
-			Supported: supportedProtocolVersions,
+			Supported: ss.server.protocolVersions,
 			Requested: validatedMeta.initializeParams.ProtocolVersion,
 		})
 		return nil, &jsonrpc.Error{
@@ -1858,8 +1985,14 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 		// In case of methodDiscover call the state.initializeParams is populated
 		// within the discover handle function to make sure the method is supported
 		// when the user is probing a pre-2026-07-28 server.
+		if !validatedMeta.usesNewProtocol {
+			return nil, &jsonrpc.Error{
+				Code:    jsonrpc.CodeMethodNotFound,
+				Message: fmt.Sprintf("%q is only supported in protocol version >= %s", req.Method, protocolVersion20260728),
+			}
+		}
 	default:
-		if !initialized && !validatedMeta.usesNewProtocol {
+		if !initialized && !validatedMeta.usesNewProtocol && req.IsCall() {
 			ss.server.opts.Logger.Error("method invalid during initialization", "method", req.Method)
 			return nil, fmt.Errorf("method %q is invalid during session initialization", req.Method)
 		}
@@ -1881,11 +2014,63 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 	// server->client calls and notifications to the incoming request from which
 	// they originated. See [idContextKey] for details.
 	ctx = context.WithValue(ctx, idContextKey{}, req.ID)
-	// For new-protocol requests, propagate the per-request log level.
 	if validatedMeta.usesNewProtocol {
-		ss.setLevel(ctx, &SetLoggingLevelParams{Level: validatedMeta.logLevel})
+		ctx = context.WithValue(ctx, logLevelContextKey{}, validatedMeta.logLevel)
 	}
-	return handleReceive(ctx, ss, req)
+
+	// subscriptions/listen parks on ctx.Done until the peer cancels it (or the
+	// underlying reader breaks). Track the request ID so ServerSession.Close
+	// can cancel the in-flight handler via jsonrpc2.Connection.Cancel and
+	// avoid deadlocking on the jsonrpc2 drain.
+	if req.Method == methodSubscriptionsListen {
+		ss.mu.Lock()
+		ss.listenIDs = append(ss.listenIDs, req.ID)
+		ss.mu.Unlock()
+		// The listen completes when the handler returns (peer cancellation,
+		// stream break, or error); drop the ID so completed listens don't
+		// accumulate in the slice indefinitely.
+		defer func() {
+			ss.mu.Lock()
+			for i, id := range ss.listenIDs {
+				if id == req.ID {
+					ss.listenIDs = append(ss.listenIDs[:i], ss.listenIDs[i+1:]...)
+					break
+				}
+			}
+			ss.mu.Unlock()
+		}()
+	}
+
+	res, err := handleReceive(ctx, ss, req)
+	if err != nil {
+		return nil, err
+	}
+	if validatedMeta.usesNewProtocol {
+		setCompleteResultType(res)
+		annotateServerInfo(res, ss.server.impl)
+	}
+	return res, nil
+}
+
+// annotateServerInfo sets [MetaKeyServerInfo] on the result's `_meta` unless
+// it is already present. Per SEP-2575, servers should identify themselves in
+// each result's `_meta`.
+func annotateServerInfo(res Result, impl *Implementation) {
+	if res == nil || impl == nil {
+		return
+	}
+	if _, isEmpty := res.(*emptyResult); isEmpty {
+		return
+	}
+	m := res.GetMeta()
+	if m == nil {
+		m = map[string]any{}
+	}
+	if _, ok := m[MetaKeyServerInfo]; ok {
+		return
+	}
+	m[MetaKeyServerInfo] = impl
+	res.SetMeta(m)
 }
 
 // InitializeParams returns the InitializeParams provided during the client's
@@ -1900,12 +2085,17 @@ func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParam
 	if params == nil {
 		return nil, fmt.Errorf("%w: \"params\" must be be provided", jsonrpc2.ErrInvalidParams)
 	}
-	var wasInit bool
+	var (
+		wasInit    bool
+		negotiated string
+	)
 	ss.updateState(func(state *ServerSessionState) {
 		wasInit = state.InitializeParams != nil
 		if !wasInit {
 			state.InitializeParams = params
+			state.NegotiatedProtocolVersion = negotiatedVersion(params.ProtocolVersion, ss.server.protocolVersions)
 		}
+		negotiated = state.NegotiatedProtocolVersion
 	})
 	if wasInit {
 		ss.server.opts.Logger.Error("duplicate initialize request")
@@ -1916,7 +2106,7 @@ func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParam
 	return &InitializeResult{
 		// TODO(rfindley): alter behavior when falling back to an older version:
 		// reject unsupported features.
-		ProtocolVersion: negotiatedVersion(params.ProtocolVersion),
+		ProtocolVersion: negotiated,
 		Capabilities:    s.capabilities(),
 		Instructions:    s.opts.Instructions,
 		ServerInfo:      s.impl,
@@ -1959,6 +2149,18 @@ func (ss *ServerSession) Close() error {
 		//    Close is idempotent and conn.Close() handles concurrent calls correctly
 		ss.keepaliveCancel()
 	}
+
+	// Unblock any in-flight subscriptions/listen handlers, which otherwise park
+	// on ctx.Done and would deadlock conn.Close (which waits for in-flight
+	// requests to drain).
+	ss.mu.Lock()
+	ids := ss.listenIDs
+	ss.listenIDs = nil
+	ss.mu.Unlock()
+	for _, id := range ids {
+		ss.conn.Cancel(id)
+	}
+
 	err := ss.conn.Close()
 
 	if ss.onClose != nil && ss.calledOnClose.CompareAndSwap(false, true) {
@@ -2104,62 +2306,4 @@ func AddReceivingCustomMethod[P paramsPtr[T], R Result, T any](
 	defer s.mu.Unlock()
 	s.receiveMethods[method] = newServerMethodInfo(typed, missingParamsOK)
 	return nil
-}
-
-// AddServerSendingCustomMethod registers a custom (non-standard) JSON-RPC
-// method that the server may send to clients.
-//
-// Registration is decoupled from invocation: extensions typically call this
-// during setup, while the actual call site uses [ServerCallCustomMethod].
-//
-//	if err := mcp.AddServerSendingCustomMethod[*PingParams, *PingResult](server, "acme/ping"); err != nil {
-//	    return err
-//	}
-//	// ... later, with a *ServerSession:
-//	result, err := mcp.ServerCallCustomMethod[*PingParams, *PingResult](
-//	    ctx, ss, "acme/ping", &PingParams{})
-//
-// AddServerSendingCustomMethod returns an error if method is the name of a
-// standard MCP method. Registering the same method twice replaces the
-// previous registration.
-func AddServerSendingCustomMethod[P paramsPtr[T], R Result, T any](
-	s *Server,
-	method string,
-) error {
-	if _, ok := clientMethodInfos[method]; ok {
-		return fmt.Errorf("mcp: AddServerSendingCustomMethod: %q shadows a standard MCP method", method)
-	}
-
-	mi := methodInfo{
-		newResult: func() Result {
-			return reflect.New(reflect.TypeFor[R]().Elem()).Interface().(R)
-		},
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sendMethods[method] = mi
-	return nil
-}
-
-// ServerCallCustomMethod sends a custom (non-standard) JSON-RPC method to the
-// client and decodes the response into R.
-//
-// The method must have been registered on the session's server via
-// [AddServerSendingCustomMethod].
-func ServerCallCustomMethod[P paramsPtr[T], R Result, T any](
-	ctx context.Context,
-	ss *ServerSession,
-	method string,
-	params P,
-) (R, error) {
-	s := ss.server
-	s.mu.Lock()
-	_, ok := s.sendMethods[method]
-	s.mu.Unlock()
-	if !ok {
-		var zero R
-		return zero, fmt.Errorf("mcp: ServerCallCustomMethod: %q is not registered; call AddServerSendingCustomMethod first", method)
-	}
-	return handleSend[R](ctx, method, newServerRequest(ss, params))
 }

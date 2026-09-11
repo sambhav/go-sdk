@@ -2,11 +2,14 @@
 # Support for the MCP base protocol
 
 1. [Lifecycle](#lifecycle)
-	1. [Discovery (`server/discover`)](#discovery-(server/discover))
-	1. [Per-request `_meta` keys](#per-request-meta-keys)
+	1. [Discovery](#discovery)
+	1. [Per-request metadata keys](#per-request-metadata-keys)
+	1. [Per-response metadata keys](#per-response-metadata-keys)
+	1. [Subscriptions](#subscriptions)
 1. [Transports](#transports)
 	1. [Stdio Transport](#stdio-transport)
 	1. [Streamable Transport](#streamable-transport)
+	1. [Legacy SSE Transport](#legacy-sse-transport)
 	1. [Custom transports](#custom-transports)
 	1. [Concurrency](#concurrency)
 1. [Authorization](#authorization)
@@ -39,8 +42,10 @@ transparently based on the negotiated protocol version:
 - A **stateless** model introduced in `2026-07-28` by
   [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2575),
   in which there is no `initialize`/`notifications/initialized` handshake, and
-  each request carries its protocol version, client identity, and client
-  capabilities in `_meta`.
+  each request carries its protocol version and client capabilities in
+  `_meta`. Clients SHOULD also include their identity (`clientInfo`) on every
+  request, and servers SHOULD include their identity (`serverInfo`) on every
+  response.
 
 In both models, the SDK exposes the same API:
 
@@ -106,7 +111,7 @@ func Example_lifecycle() {
 }
 ```
 
-### Discovery (`server/discover`)
+### Discovery
 
 Introduced in `2026-07-28` by
 [SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2575),
@@ -123,23 +128,64 @@ request. Servers implementing `2026-07-28` MUST implement it.
   fails or the server does not support the latest version, the client falls back to the
   legacy `initialize` handshake.
 
-### Per-request `_meta` keys
+A server advertises and negotiates every protocol version the SDK supports;
+set [`ServerOptions.SupportedProtocolVersions`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#ServerOptions)
+to narrow that set, for example to stop serving a revision your deployment has
+retired.
+
+```go
+server := mcp.NewServer(&mcp.Implementation{Name: "server", Version: "v1.0.0"}, &mcp.ServerOptions{
+	SupportedProtocolVersions: []string{"2026-07-28", "2025-11-25"},
+})
+```
+
+The set can only narrow support, never widen it; the field's documentation
+covers how each protocol era answers a request at an excluded version.
+
+### Per-request metadata keys
 
 When the negotiated protocol version is `2026-07-28` or later, every request
 carries these keys inside its `_meta` map (constants live in
 [`mcp/protocol.go`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#pkg-constants)):
 
-| Constant | Wire key | Type |
-|---|---|---|
-| `MetaKeyProtocolVersion` | `io.modelcontextprotocol/protocolVersion` | `string` |
-| `MetaKeyClientInfo` | `io.modelcontextprotocol/clientInfo` | `*Implementation` |
-| `MetaKeyClientCapabilities` | `io.modelcontextprotocol/clientCapabilities` | `*ClientCapabilities` |
-| `MetaKeyLogLevel` | `io.modelcontextprotocol/logLevel` | `LoggingLevel` (deprecated by SEP-2577) |
+| Constant | Wire key | Type | Required |
+|---|---|---|---|
+| `MetaKeyProtocolVersion` | `io.modelcontextprotocol/protocolVersion` | `string` | Yes |
+| `MetaKeyClientCapabilities` | `io.modelcontextprotocol/clientCapabilities` | `*ClientCapabilities` | Yes |
+| `MetaKeyClientInfo` | `io.modelcontextprotocol/clientInfo` | `*Implementation` | No |
+| `MetaKeyLogLevel` | `io.modelcontextprotocol/logLevel` | `LoggingLevel` (deprecated by SEP-2577) | No |
 
-The client populates these keys automatically on every outgoing request.
-Server-side handlers can read them
-through `ServerRequest[P].ProtocolVersion()`, `ServerRequest[P].ClientInfo()`,
-and `ServerRequest[P].ClientCapabilities()`.
+The client populates the required keys automatically on every outgoing
+request, and populates `clientInfo` when configured with an `*Implementation`
+(the default). Server-side handlers can read them through
+`ServerRequest[P].ProtocolVersion()`, `ServerRequest[P].ClientInfo()`, and
+`ServerRequest[P].ClientCapabilities()`.
+
+### Per-response metadata keys
+
+Under the same protocol version, servers SHOULD identify themselves on every
+response. The SDK populates this
+key automatically on every outgoing response:
+
+| Constant | Wire key | Type | Required |
+|---|---|---|---|
+| `MetaKeyServerInfo` | `io.modelcontextprotocol/serverInfo` | `*Implementation` | No |
+
+### Subscriptions
+
+Introduced in `2026-07-28` by
+[SEP-2575](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2575),
+`subscriptions/listen` replaces the legacy `resources/subscribe` RPC and
+the GET-based SSE endpoint with a single long-lived request that
+multiplexes every kind of server-to-client change notification a client
+opts in to. On the wire the client sends one `subscriptions/listen`
+request whose `notifications` field enumerates what it wants
+(`toolsListChanged`, `promptsListChanged`, `resourcesListChanged`, and/or
+a list of resource URIs in `resourceSubscriptions`); the server replies
+first with a `notifications/subscriptions/acknowledged` notification
+reporting the honored subset, then streams every change notification on
+the same request, and finally closes with a `SubscriptionsListenResult`
+when it tears the subscription down.
 
 ## Transports
 
@@ -225,7 +271,8 @@ connect to the server:
 transport := &mcp.StreamableClientTransport{
 	Endpoint: "http://localhost:8080/mcp",
 }
-client, err := mcp.Connect(ctx, transport, &mcp.ClientOptions{...})
+client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "v1.0.0"}, nil)
+session, err := client.Connect(ctx, transport, nil)
 ```
 
 The `StreamableClientTransport` handles the HTTP requests and communicates with
@@ -309,6 +356,63 @@ to see the logical session
 _See [examples/server/distributed](https://github.com/modelcontextprotocol/go-sdk/blob/main/examples/server/distributed/main.go) for
 an example using stateless mode to implement a server distributed across
 multiple processes._
+
+### Legacy SSE Transport
+
+Before the streamable transport, the
+[2024-11-05](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports)
+spec defined an HTTP transport built from two endpoints: a hanging GET that
+streams server-to-client messages as server-sent events, and a per-session
+endpoint the client POSTs its messages to. The SDK still implements it, for
+talking to peers that predate the streamable transport. New deployments should
+use the [streamable transport](#streamable-transport) instead.
+
+It is implemented across three types, mirroring the streamable ones:
+
+- [`SSEHandler`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#SSEHandler):
+  an `http.Handler` that creates a session per incoming GET and routes POSTs to
+  the right session. Construct it with
+  [`NewSSEHandler`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#NewSSEHandler),
+  which takes a function returning the `Server` to serve a given request.
+- [`SSEServerTransport`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#SSEServerTransport):
+  one such session. Reach for it directly only when serving the two endpoints
+  yourself; `SSEHandler` creates these for you.
+- [`SSEClientTransport`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#SSEClientTransport):
+  the client side, which needs only the `Endpoint` of the GET.
+
+```go
+func ExampleSSEHandler() {
+	server := mcp.NewServer(&mcp.Implementation{Name: "adder", Version: "v0.0.1"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "add", Description: "add two numbers"}, Add)
+
+	handler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	ctx := context.Background()
+	transport := &mcp.SSEClientTransport{Endpoint: httpServer.URL}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "v1.0.0"}, nil)
+	cs, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "add",
+		Arguments: map[string]any{"x": 1, "y": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(res.Content[0].(*mcp.TextContent).Text)
+
+	// Output: 3
+}
+```
+
+_See [examples/server/sse](https://github.com/modelcontextprotocol/go-sdk/blob/main/examples/server/sse/main.go)
+for a standalone server._
 
 ### Custom transports
 
@@ -535,24 +639,24 @@ provided to
 
 ### Server-Side Request Forgery
 
-The [mitigations](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices#mitigation-3) are as follows:
+The OAuth discovery helpers apply these [mitigations](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices#mitigation-3) by default:
 
-- _Enforce HTTPS_. The OAuth helpers provided by the SDK reject the `http://` URLs
-except loopback addresses (`localhost`, `127.0.0.1`, `::1`).
+- _Enforce HTTPS_. Reject `http://` URLs (except loopback: `localhost`, `127.0.0.1`, `::1`)
+and redirects that downgrade `https` to a non-`https` scheme.
 
-- _Block Private IP Ranges_. The OAuth helpers provided by the SDK allow passing
-a custom `http.Client`. Developers are advised to customize the client it with
-appropriate network protections, including IP range blocking. The SDK does not provide
-this capability out of the box.
+- _Block Private IP Ranges_. Reject targets that resolve to a non-public address
+(private, link-local including the `169.254.169.254` metadata endpoint, CGNAT, multicast,
+unspecified). The check runs on the initial URL and at dial time, guarding against DNS rebinding.
 
-- _Validate Redirect Targets_. Similarly to previous point, customized `http.Client`
-can be used to validate network hops. The SDK does not provide this capability out
-of the box.
+- _Validate Redirect Targets_. Reject redirects to non-public addresses and cap the redirect count.
 
-- _Use Egress Proxies_. This is out of scope for the SDK and can be configured separately.
+- _Use Egress Proxies_. Out of scope for the SDK; configure separately.
 
-- _DNS Resolution Considerations_. The SDK has DNS rebinding protection on the server side which is enabled by default. For the client side, consider providing
-a custom `http.Client` that would implement DNS pinning.
+**Opting out.** Passing a custom `http.Client` can bypass these checks, making SSRF
+protection your responsibility. Specifically: a custom `Transport.DialContext`/`DialTLSContext`,
+a non-`*http.Transport`, or a configured `Proxy` disables the dial-time IP check; setting
+`CheckRedirect` replaces all redirect validation. In these cases, implement your own IP
+blocking, redirect validation, and DNS pinning.
 
 ### Session Hijacking
 
